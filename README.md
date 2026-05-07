@@ -131,7 +131,8 @@ python evaluation/RM-Bench/evaluate_rmbench.py \
   --method rala \
   --pairing official \
   --model_id /path/to/base-or-sft-model \
-  --adapter_dir /path/to/sft-or-policy-adapter \
+  --adapter_dir /path/to/rlhf-checkpoint/policy_adapter/policy \
+  --fusion_state /path/to/rlhf-checkpoint/fusion_state.json \
   --disc_adapter_dir /path/to/dual-head-sft-adapter \
   --disc_head /path/to/reward_head.pt \
   --reward_gen_lora /path/to/generative-rm-lora \
@@ -139,7 +140,10 @@ python evaluation/RM-Bench/evaluate_rmbench.py \
   --output_json /path/to/rmbench_result.json
 ```
 
-The official RM-Bench schema contains three `chosen` responses and three
-`rejected` responses per prompt, ordered as concise, detailed plain text, and
-detailed markdown. The evaluator compares all 3x3 pairs and writes aggregate
-metrics under `summary.rmbench_official.table`.
+For `--method rala`, the reported score is the fused composite reward used by
+RALA: the discriminative component uses `--disc_adapter_dir` and `--disc_head`,
+the generative component uses `--reward_gen_lora`, and the endogenous component
+uses `--model_id` with `--adapter_dir`. The evaluator range-normalizes the
+three chosen and three rejected scores for each prompt, then combines the
+components with inverse-variance weights loaded from the training checkpoint's
+`fusion_state.json`.
