@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 import os
 from collections import defaultdict
 from pathlib import Path
@@ -275,10 +274,68 @@ class DiscScorer:
         return float(self.head(pooled.float()).squeeze(-1).item())
 
 
-def zscore(values: Sequence[float]) -> List[float]:
-    mean = sum(values) / len(values)
-    std = math.sqrt(max(sum((x - mean) ** 2 for x in values) / len(values), 1e-12))
-    return [(x - mean) / std for x in values]
+def range_normalize(values: Sequence[float], eps: float) -> List[float]:
+    vals = [float(x) for x in values]
+    if not vals:
+        return []
+    mean = sum(vals) / len(vals)
+    scale = max(max(vals) - min(vals), eps)
+    return [(x - mean) / scale for x in vals]
+
+
+def load_rala_fusion_weights(
+    fusion_state_path: str,
+    adapter_dir: str,
+    active: Sequence[str],
+    eps: float,
+) -> Tuple[Dict[str, float], Dict[str, Any]]:
+    active_keys = list(active)
+    if not active_keys:
+        raise ValueError("RALA fusion requires at least one active reward stream.")
+
+    candidates: List[Path] = []
+    if fusion_state_path:
+        candidates.append(Path(fusion_state_path))
+    elif adapter_dir:
+        adapter_path = Path(adapter_dir)
+        candidates.extend(
+            [
+                adapter_path / "fusion_state.json",
+                adapter_path.parent / "fusion_state.json",
+                adapter_path.parent.parent / "fusion_state.json",
+            ]
+        )
+
+    state_path = next((path for path in candidates if path.exists()), None)
+    if state_path is None:
+        checked = ", ".join(str(path) for path in candidates) if candidates else "(no candidate paths)"
+        raise FileNotFoundError(
+            "RALA evaluation requires a trained fusion_state.json; "
+            f"pass --fusion_state or use --adapter_dir under a checkpoint. Checked: {checked}"
+        )
+
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    if "eps" in state:
+        eps = float(state["eps"])
+    raw_sigmas = state.get("sigma")
+    if not isinstance(raw_sigmas, dict):
+        raise ValueError(f"RALA fusion state does not contain a sigma dict: {state_path}")
+    missing = [key for key in active_keys if key not in raw_sigmas]
+    if missing:
+        raise ValueError(f"RALA fusion state {state_path} is missing sigma for streams: {missing}")
+    sigmas = {key: max(float(raw_sigmas[key]), eps) for key in active_keys}
+
+    inv = {key: 1.0 / (sigmas[key] * sigmas[key] + eps) for key in active_keys}
+    denom = sum(inv.values())
+    weights = {key: inv[key] / denom for key in active_keys}
+    return weights, {
+        "mode": "range_normalized_inverse_variance",
+        "source": str(state_path),
+        "active_streams": active_keys,
+        "sigma": sigmas,
+        "weights": weights,
+        "eps": eps,
+    }
 
 
 def mean_present(values: Sequence[Any]) -> Any:
@@ -392,10 +449,28 @@ def main() -> None:
     p.add_argument("--max_examples", type=int, default=0)
     p.add_argument("--group_fields", default="category,domain,difficulty,level,subset")
     p.add_argument("--output_json", default="")
+    p.add_argument(
+        "--fusion_state",
+        default="",
+        help="RALA fusion_state.json. If omitted, the evaluator tries to infer it from --adapter_dir and fails if not found.",
+    )
+    p.add_argument("--fusion_eps", type=float, default=1e-6)
     args = p.parse_args()
     if args.load_in_8bit:
         args.load_in_4bit = False
     set_offline_env(args.offline)
+
+    rala_weights: Dict[str, float] = {}
+    rala_fusion_info: Dict[str, Any] = {}
+    fusion_eps = float(args.fusion_eps)
+    if args.method == "rala":
+        rala_weights, rala_fusion_info = load_rala_fusion_weights(
+            args.fusion_state,
+            args.adapter_dir,
+            ("endo", "gen", "disc"),
+            fusion_eps,
+        )
+        fusion_eps = float(rala_fusion_info["eps"])
 
     scorers: Dict[str, Any] = {}
     if args.method in {"endo", "rala"}:
@@ -425,14 +500,26 @@ def main() -> None:
             }
             for name, scorer in scorers.items()
         }
-        record_outputs.append(
-            {
-                "record_index": ridx,
-                "id": record.get("id", record.get("ID", ridx)),
-                "domain": record_domain,
-                "component_scores": scored,
-            }
-        )
+        normalized_scored: Dict[str, Dict[str, List[float]]] = {}
+        if args.method == "rala":
+            for name, scores in scored.items():
+                values = [float(x) for x in scores["chosen"]] + [float(x) for x in scores["rejected"]]
+                normalized = range_normalize(values, fusion_eps)
+                split = len(scores["chosen"])
+                normalized_scored[name] = {
+                    "chosen": normalized[:split],
+                    "rejected": normalized[split:],
+                }
+        record_output = {
+            "record_index": ridx,
+            "id": record.get("id", record.get("ID", ridx)),
+            "domain": record_domain,
+            "component_scores": scored,
+        }
+        if args.method == "rala":
+            record_output["component_scores_normalized"] = normalized_scored
+            record_output["rala_weights"] = rala_weights
+        record_outputs.append(record_output)
         for pidx, pair in enumerate(pairs):
             chosen_index = pair["chosen_index"]
             rejected_index = pair["rejected_index"]
@@ -441,35 +528,40 @@ def main() -> None:
                 for name, scores in scored.items()
             }
             if args.method == "rala":
-                fused = [0.0, 0.0]
-                for scores in raw.values():
-                    z = zscore([scores[0], scores[1]])
-                    fused[0] += z[0]
-                    fused[1] += z[1]
-                chosen_score, rejected_score = fused
+                raw_normalized = {
+                    name: (
+                        scores["chosen"][chosen_index],
+                        scores["rejected"][rejected_index],
+                    )
+                    for name, scores in normalized_scored.items()
+                }
+                chosen_score = sum(rala_weights[name] * raw_normalized[name][0] for name in raw_normalized)
+                rejected_score = sum(rala_weights[name] * raw_normalized[name][1] for name in raw_normalized)
             else:
                 chosen_score, rejected_score = raw[args.method]
-            results.append(
-                {
-                    "record_index": ridx,
-                    "pair_index": pidx,
-                    "chosen_index": chosen_index,
-                    "rejected_index": rejected_index,
-                    "chosen_style": pair["chosen_style"],
-                    "rejected_style": pair["rejected_style"],
-                    "difficulty": pair["difficulty"],
-                    "domain": record_domain,
-                    "correct": bool(chosen_score > rejected_score),
-                    "score_chosen": chosen_score,
-                    "score_rejected": rejected_score,
-                    "component_scores": raw,
-                    "meta": {
-                        **{k: record.get(k) for k in group_fields if k in record},
-                        "rmbench_domain": record_domain,
-                        "rmbench_difficulty": pair["difficulty"],
-                    },
-                }
-            )
+            result = {
+                "record_index": ridx,
+                "pair_index": pidx,
+                "chosen_index": chosen_index,
+                "rejected_index": rejected_index,
+                "chosen_style": pair["chosen_style"],
+                "rejected_style": pair["rejected_style"],
+                "difficulty": pair["difficulty"],
+                "domain": record_domain,
+                "correct": bool(chosen_score > rejected_score),
+                "score_chosen": chosen_score,
+                "score_rejected": rejected_score,
+                "component_scores": raw,
+                "meta": {
+                    **{k: record.get(k) for k in group_fields if k in record},
+                    "rmbench_domain": record_domain,
+                    "rmbench_difficulty": pair["difficulty"],
+                },
+            }
+            if args.method == "rala":
+                result["component_scores_normalized"] = raw_normalized
+                result["rala_weights"] = rala_weights
+            results.append(result)
     if not results:
         raise RuntimeError("No RM-Bench pairs were evaluated. Check the dataset schema and --pairing mode.")
     payload = {
@@ -477,6 +569,9 @@ def main() -> None:
         "record_scores": record_outputs,
         "results": results,
     }
+    if args.method == "rala":
+        payload["summary"]["rala_fusion"] = rala_fusion_info
+        payload["rala_fusion"] = rala_fusion_info
     if args.output_json:
         Path(args.output_json).parent.mkdir(parents=True, exist_ok=True)
         Path(args.output_json).write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
